@@ -2,6 +2,7 @@
 *.csv
 !forward_log.csv
 
+launcher.vbs
 __pycache__/
 .claude/
 site/
