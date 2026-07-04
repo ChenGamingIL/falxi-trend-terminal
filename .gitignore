@@ -1,0 +1,8 @@
+# local data files (large; not needed by the site)
+*.csv
+!forward_log.csv
+
+__pycache__/
+.claude/
+site/
+reit_history.csv

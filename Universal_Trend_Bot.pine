@@ -1,0 +1,125 @@
+//@version=6
+// ============================================================================
+//  בוט טרנד אוניברסלי — Donchian Breakout + Chandelier Trail
+//  Universal Trend-Following Bot  |  Daily (D1)  |  for funded / prop accounts
+// ----------------------------------------------------------------------------
+//  סקריפט אחד, שלושה בוטים: הרץ אותו על גרף Daily של כל אחד מ:
+//     🥇 זהב (XAUUSD)   🛢️ נפט (WTI/USOIL)   📈 נאסד"ק (NAS100/US100)
+//  זו הליבה של מערכות ה-CTA / Turtle: לסחור *עם* המגמה, לרכב על מהלכים
+//  גדולים, לחתוך הפסדים קטן. מכשירים שנוטים לטרנד -> יתרון אמיתי.
+//
+//  ✅ ולידציה (נתונים אמיתיים, יומי, 10 שנים — ראה RESULTS.md):
+//     בודד:   זהב PF 3.6 | נפט PF 1.7 | נאסד"ק PF 1.4
+//     תיק משולב (סיכון 1%): +96% ל-10 שנים, CAGR +7.1%, PF 2.08, DD 4.8%
+//     Out-of-Sample: אימון PF 1.96 / בדיקה PF 2.22 — עמד במבחן, ללא Overfitting.
+//
+//  ⚠️ עובד רק על מכשירים שנוטים לטרנד. אל תריץ על EUR/USD או AUD/USD —
+//     שם למערכת אין יתרון (מטבעות מייג'ור עושים דשדוש/היפוך).
+//
+//  לוגיקה:
+//     לונג  = סגירה מעל השיא של N הנרות הקודמים  וגם  מעל 200 EMA
+//     שורט  = סגירה מתחת לשפל של N הנרות הקודמים וגם  מתחת 200 EMA
+//     סטופ  = התחלתי 2×ATR, ואז נגרר (Chandelier) 3×ATR.
+// ============================================================================
+
+strategy("Universal Trend Bot - D1", overlay = true, initial_capital = 10000,
+         currency = currency.USD, commission_type = strategy.commission.percent,
+         commission_value = 0.0, pyramiding = 0, process_orders_on_close = true,
+         default_qty_type = strategy.fixed, calc_on_every_tick = false)
+
+// ---------------------------------------------------------------------------
+//  קלטים
+// ---------------------------------------------------------------------------
+entryLen  = input.int(40,  "אורך פריצה (Donchian)", minval = 5,  group = "כניסה",
+            tooltip = "יציב על 20-70. 40 נתן את ה-PF הטוב ביותר.")
+trendLen  = input.int(200, "אורך EMA מגמה",         minval = 20, group = "כניסה")
+
+atrLen    = input.int(14,  "אורך ATR",              minval = 1,  group = "סיכון")
+stopMult  = input.float(2.0,"סטופ התחלתי (×ATR)",   minval = 0.5, step = 0.1, group = "סיכון")
+trailMult = input.float(3.0,"סטופ נגרר (×ATR)",     minval = 0.5, step = 0.1, group = "סיכון")
+riskPct   = input.float(1.0,"סיכון לעסקה (%)",      minval = 0.1, step = 0.1, group = "סיכון",
+            tooltip = "1% -> DD ~5% על התיק. 0.5% ל-DD ~2%. 2% ל-DD ~8% (קרוב למגבלת מימון).")
+
+allowLong  = input.bool(true, "אפשר לונג",  group = "כיוון")
+allowShort = input.bool(true, "אפשר שורט", group = "כיוון")
+
+// ---------------------------------------------------------------------------
+//  חישובים
+// ---------------------------------------------------------------------------
+trendEma = ta.ema(close, trendLen)
+atr      = ta.atr(atrLen)
+hh = ta.highest(high, entryLen)[1]   // שיא N הנרות הקודמים (ללא הצצה קדימה)
+ll = ta.lowest(low,  entryLen)[1]
+
+plot(trendEma, "Trend EMA 200", color = color.new(color.orange, 0), linewidth = 2)
+plot(hh, "Breakout High", color = color.new(color.green, 60), style = plot.style_stepline)
+plot(ll, "Breakout Low",  color = color.new(color.red,   60), style = plot.style_stepline)
+
+longSig  = close > hh and close > trendEma
+shortSig = close < ll and close < trendEma
+flat = strategy.position_size == 0
+
+stopDist = atr * stopMult
+qty = stopDist > 0 ? (strategy.equity * riskPct / 100.0) / stopDist : na
+
+// ---------------------------------------------------------------------------
+//  כניסות
+// ---------------------------------------------------------------------------
+if flat and longSig and allowLong and not na(qty)
+    strategy.entry("Long", strategy.long, qty = qty)
+if flat and shortSig and allowShort and not na(qty)
+    strategy.entry("Short", strategy.short, qty = qty)
+
+// ---------------------------------------------------------------------------
+//  סטופ נגרר Chandelier
+// ---------------------------------------------------------------------------
+var float stopL = na
+var float stopS = na
+var float hhSince = na
+var float llSince = na
+
+if strategy.position_size > 0
+    hhSince := na(hhSince) ? high : math.max(hhSince, high)
+    stopL := na(stopL) ? strategy.position_avg_price - atr * stopMult : math.max(stopL, hhSince - atr * trailMult)
+    strategy.exit("L-Exit", from_entry = "Long", stop = stopL)
+else
+    stopL := na
+    hhSince := na
+
+if strategy.position_size < 0
+    llSince := na(llSince) ? low : math.min(llSince, low)
+    stopS := na(stopS) ? strategy.position_avg_price + atr * stopMult : math.min(stopS, llSince + atr * trailMult)
+    strategy.exit("S-Exit", from_entry = "Short", stop = stopS)
+else
+    stopS := na
+    llSince := na
+
+// ---------------------------------------------------------------------------
+//  סימונים + התראות
+// ---------------------------------------------------------------------------
+plotshape(flat and longSig  and allowLong,  "Long",  shape.triangleup,   location.belowbar, color.green, text = "LONG")
+plotshape(flat and shortSig and allowShort, "Short", shape.triangledown, location.abovebar, color.red,   text = "SHORT")
+
+if flat and longSig and allowLong
+    alert("TREND LONG breakout on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if flat and shortSig and allowShort
+    alert("TREND SHORT breakout on " + syminfo.ticker + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------------------
+//  לוח נתונים
+// ---------------------------------------------------------------------------
+var table dash = table.new(position.top_right, 2, 6, border_width = 1)
+row(i, k, v, col) =>
+    table.cell(dash, 0, i, k, text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, i, v, text_color = col,        text_size = size.small, text_halign = text.align_right)
+if barstate.islast
+    posTxt = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "Flat"
+    posCol = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    wr  = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    net = (strategy.equity - strategy.initial_capital) / strategy.initial_capital * 100
+    row(0, "מכשיר", syminfo.ticker, color.white)
+    row(1, "פוזיציה", posTxt, posCol)
+    row(2, "עסקאות", str.tostring(strategy.closedtrades), color.white)
+    row(3, "אחוז הצלחה", str.tostring(wr, "#.#") + "%", color.white)
+    row(4, "רווח נקי %", str.tostring(net, "#.##") + "%", net >= 0 ? color.green : color.red)
+    row(5, "כיוון מגמה", close > trendEma ? "עולה ↑" : "יורד ↓", close > trendEma ? color.green : color.red)

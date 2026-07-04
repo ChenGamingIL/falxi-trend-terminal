@@ -1,0 +1,188 @@
+//@version=6
+// ============================================================================
+//  בוט אסטרטגיית 50 + 200 EMA  |  EUR/USD  |  M15
+//  EMA 50 + 200 Strategy Bot  -  for funded / prop trading accounts
+// ----------------------------------------------------------------------------
+//  הלוגיקה (מתוך התמונה - טרנד פולואינג):
+//    - נר נסגר מתחת ל-50 EMA וה-200 EMA מתחת למחיר -> SHORT, יעד = 200 EMA
+//    - נר נסגר מעל  ל-50 EMA וה-200 EMA מעל  למחיר -> LONG,  יעד = 200 EMA
+//  כולל: Trailing Stop (כבוי כברירת מחדל), לוח נתונים, ובלם הפסד יומי.
+//
+//  🚨 מסקנת ולידציה קפדנית (נתונים אמיתיים, ראה RESULTS.md):
+//     לאסטרטגיה הזו אין יתרון סטטיסטי יציב. מה שנראה רווחי על שנה אחת
+//     התהפך לשלילי על 2.8 שנים (EUR/USD: ‑6.4%, PF 0.95, DD 24%),
+//     ובדיקת Out-of-Sample סתרה את עצמה. אל תסחור בזה כסף אמיתי כמו שהוא.
+//     היתרון החלש היחיד: מכשירים שנוטים לטרנד (זהב/נאסד"ק), לא FX.
+//     הכלי מסופק ללימוד, לבדיקה ולבסיס לפיתוח - לא כמערכת מוכנה.
+//
+//  הגדרות מומלצות אם בכל זאת בודקים: H1, יעד 1.5R, בלי Trailing, סיכון 0.5%.
+// ============================================================================
+
+strategy(title               = "EMA 50/200 Bot - EURUSD M15",
+         overlay             = true,
+         initial_capital     = 10000,
+         currency            = currency.USD,
+         commission_type     = strategy.commission.percent,
+         commission_value    = 0.0,
+         pyramiding          = 0,
+         calc_on_every_tick  = false,
+         process_orders_on_close = true)
+
+// ---------------------------------------------------------------------------
+//  קלטים / Inputs
+// ---------------------------------------------------------------------------
+emaFastLen = input.int(50,  "EMA מהיר",  minval = 1, group = "ממוצעים נעים")
+emaSlowLen = input.int(200, "EMA איטי",  minval = 1, group = "ממוצעים נעים")
+
+riskPct    = input.float(0.5, "סיכון לעסקה (%)", minval = 0.1, step = 0.1, group = "ניהול סיכון")
+atrLen     = input.int(14,   "אורך ATR",         minval = 1,   group = "ניהול סיכון")
+atrMult    = input.float(1.5,"מכפיל ATR לסטופ",  minval = 0.1, step = 0.1, group = "ניהול סיכון")
+minRR      = input.float(1.0,"יחס R:R מינ'",     minval = 0.1, step = 0.1, group = "ניהול סיכון")
+
+// --- בחירת יעד / Target mode ---
+tpFixed    = input.bool(true, "יעד קבוע ב-R (מומלץ) במקום 200 EMA", group = "יעד",
+             tooltip = "מסומן = יעד = R כפול הסטופ (התצורה המנצחת). לא מסומן = יעד דינמי על ה-200 EMA")
+tpR        = input.float(1.5, "יחס יעד (R)", minval = 0.1, step = 0.1, group = "יעד")
+
+// --- בורר כיוון / Trade direction ---
+tradeDir   = input.string("Both", "כיוון מסחר", options = ["Both", "Shorts only", "Longs only"], group = "כיוון",
+             tooltip = "בבאק-טסט (H1, שנה) שורט-בלבד נתן PF 1.63 ו-DD 2.3% - הכי טוב. אך זה תלוי-מגמה: אם השוק יתהפך לעלייה, שורט-בלבד יסבול.")
+allowLong  = tradeDir != "Shorts only"
+allowShort = tradeDir != "Longs only"
+
+// --- 1) Trailing Stop (כבוי - פגע בבאק-טסט) ---
+useTrail   = input.bool(false, "הפעל Trailing Stop", group = "Trailing Stop")
+trailMult  = input.float(1.5, "מרחק Trailing (×ATR)", minval = 0.1, step = 0.1, group = "Trailing Stop")
+
+// --- 3) בלם הפסד יומי / Daily loss brake ---
+useBrake   = input.bool(true, "הפעל בלם הפסד יומי", group = "בלם הגנה")
+maxDayLoss = input.int(3,    "מקס' הפסדים ביום",    minval = 1,   group = "בלם הגנה")
+maxDayDD   = input.float(3.0,"מקס' הפסד יומי (%)",  minval = 0.1, step = 0.1, group = "בלם הגנה")
+
+// ---------------------------------------------------------------------------
+//  חישובים
+// ---------------------------------------------------------------------------
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+atr     = ta.atr(atrLen)
+
+plot(emaFast, "EMA 50",  color = color.new(color.blue, 0), linewidth = 2)
+plot(emaSlow, "EMA 200", color = color.new(color.red,  0), linewidth = 2)
+
+// תנאי כניסה: המחיר חוצה את ה-50 וה-200 נמצא בכיוון היעד
+crossDown = ta.crossunder(close, emaFast)
+crossUp   = ta.crossover(close, emaFast)
+trendDown = emaSlow < close   // 200 מתחת -> יש מקום לרדת אליו (שורט)
+trendUp   = emaSlow > close   // 200 מעל  -> יש מקום לעלות אליו (לונג)
+
+flat = strategy.position_size == 0
+
+// ---------------------------------------------------------------------------
+//  בלם הפסד יומי / Daily brake state
+// ---------------------------------------------------------------------------
+newDay = ta.change(time("D")) != 0
+var float dayStartEq = strategy.equity
+var int   dayLosses  = 0
+var bool  blocked    = false
+var int   prevClosed = 0
+
+if newDay
+    dayStartEq := strategy.equity
+    dayLosses  := 0
+    blocked    := false
+
+// ספירת הפסדים שנסגרו היום
+if strategy.closedtrades > prevClosed
+    for k = prevClosed to strategy.closedtrades - 1
+        if strategy.closedtrades.profit(k) < 0
+            dayLosses += 1
+    prevClosed := strategy.closedtrades
+
+dayPnLpct = (strategy.equity - dayStartEq) / dayStartEq * 100.0
+if useBrake and not blocked and (dayLosses >= maxDayLoss or dayPnLpct <= -maxDayDD)
+    blocked := true
+
+// ---------------------------------------------------------------------------
+//  גודל פוזיציה לפי סיכון
+// ---------------------------------------------------------------------------
+riskCapital = strategy.equity * riskPct / 100.0
+stopDist    = atr * atrMult
+qty         = stopDist > 0 ? riskCapital / stopDist : na
+
+// ---------------------------------------------------------------------------
+//  כניסות
+// ---------------------------------------------------------------------------
+shortTP = emaSlow
+longTP  = emaSlow
+goShort = crossDown and trendDown and shortTP < close and (close - shortTP) / stopDist >= minRR
+goLong  = crossUp   and trendUp   and longTP  > close and (longTP - close) / stopDist >= minRR
+
+canTrade = flat and not blocked and not na(qty)
+
+if canTrade and goShort and allowShort
+    strategy.entry("Short", strategy.short, qty = qty)
+if canTrade and goLong and allowLong
+    strategy.entry("Long", strategy.long, qty = qty)
+
+// ---------------------------------------------------------------------------
+//  יציאות: סטופ + יעד 200 EMA + Trailing
+// ---------------------------------------------------------------------------
+var float stopL  = na
+var float stopS  = na
+var float tpLock = na   // יעד נעול ברגע הכניסה (למצב יעד קבוע)
+
+if strategy.position_size > 0
+    if na(stopL)
+        sd     = atr * atrMult
+        stopL  := strategy.position_avg_price - sd
+        tpLock := strategy.position_avg_price + tpR * sd
+    if useTrail
+        stopL := math.max(stopL, high - atr * trailMult)   // נגרר כלפי מעלה בלבד
+    tp = tpFixed ? tpLock : emaSlow
+    strategy.exit("L-Exit", from_entry = "Long", stop = stopL, limit = tp)
+else
+    stopL := na
+
+if strategy.position_size < 0
+    if na(stopS)
+        sd     = atr * atrMult
+        stopS  := strategy.position_avg_price + sd
+        tpLock := strategy.position_avg_price - tpR * sd
+    if useTrail
+        stopS := math.min(stopS, low + atr * trailMult)    // נגרר כלפי מטה בלבד
+    tp = tpFixed ? tpLock : emaSlow
+    strategy.exit("S-Exit", from_entry = "Short", stop = stopS, limit = tp)
+else
+    stopS := na
+
+// ---------------------------------------------------------------------------
+//  סימוני אותות + התראות
+// ---------------------------------------------------------------------------
+plotshape(canTrade and goShort and allowShort, "Short", shape.triangledown, location.abovebar, color.red,   text = "SHORT")
+plotshape(canTrade and goLong  and allowLong,  "Long",  shape.triangleup,   location.belowbar, color.green, text = "LONG")
+
+if canTrade and goShort and allowShort
+    alert("SHORT EURUSD @ " + str.tostring(close, format.mintick) + " | TP " + str.tostring(shortTP, format.mintick), alert.freq_once_per_bar_close)
+if canTrade and goLong and allowLong
+    alert("LONG EURUSD @ "  + str.tostring(close, format.mintick) + " | TP " + str.tostring(longTP,  format.mintick), alert.freq_once_per_bar_close)
+
+// ---------------------------------------------------------------------------
+//  2) לוח נתונים על הגרף / Dashboard
+// ---------------------------------------------------------------------------
+var table dash = table.new(position.top_right, 2, 7, border_width = 1)
+f_row(_i, _k, _v, _col) =>
+    table.cell(dash, 0, _i, _k, text_color = color.gray,  text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, _i, _v, text_color = _col,        text_size = size.small, text_halign = text.align_right)
+
+if barstate.islast
+    posTxt = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "Flat"
+    posCol = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0.0
+    netPct  = (strategy.equity - strategy.initial_capital) / strategy.initial_capital * 100
+    f_row(0, "מצב",          blocked ? "🛑 חסום" : "✅ פעיל", blocked ? color.red : color.green)
+    f_row(1, "פוזיציה",      posTxt, posCol)
+    f_row(2, "הפסד יומי %",  str.tostring(dayPnLpct, "#.##") + "%", dayPnLpct < 0 ? color.red : color.green)
+    f_row(3, "הפסדים היום",  str.tostring(dayLosses) + " / " + str.tostring(maxDayLoss), color.orange)
+    f_row(4, "סה\"כ עסקאות", str.tostring(strategy.closedtrades), color.white)
+    f_row(5, "אחוז הצלחה",   str.tostring(winRate, "#.#") + "%", color.white)
+    f_row(6, "רווח נקי %",   str.tostring(netPct, "#.##") + "%", netPct >= 0 ? color.green : color.red)

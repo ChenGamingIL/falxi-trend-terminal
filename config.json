@@ -1,0 +1,5 @@
+{
+  "tickers": ["O", "VNQ", "XLRE", "PLD", "SPG", "STAG", "AMT"],
+  "dividend_yield_alert_pct": 5.0,
+  "csv_path": "reit_history.csv"
+}
